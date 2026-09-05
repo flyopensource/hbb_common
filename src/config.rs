@@ -75,6 +75,8 @@ lazy_static::lazy_static! {
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
     pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    static ref HIDDEN_SERVER_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    static ref HIDDEN_SERVER_PASSWORD: RwLock<String> = Default::default();
     pub static ref DEFAULT_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
@@ -82,6 +84,9 @@ lazy_static::lazy_static! {
     pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
 }
+
+static PROVISIONED_SERVER_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "android")]
 lazy_static::lazy_static! {
@@ -910,7 +915,10 @@ impl Config {
     pub fn get_rendezvous_server() -> String {
         let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
         if rendezvous_server.is_empty() {
-            rendezvous_server = Self::get_option("custom-rendezvous-server");
+            rendezvous_server = Self::get_effective_server_option("custom-rendezvous-server");
+        }
+        if rendezvous_server.is_empty() && Self::is_provisioned_server_required() {
+            return String::new();
         }
         if rendezvous_server.is_empty() {
             rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
@@ -924,6 +932,9 @@ impl Config {
                 .next()
                 .unwrap_or_default();
         }
+        if rendezvous_server.is_empty() {
+            return String::new();
+        }
         if !rendezvous_server.contains(':') {
             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
         }
@@ -935,9 +946,12 @@ impl Config {
         if !s.is_empty() {
             return vec![s];
         }
-        let s = Self::get_option("custom-rendezvous-server");
+        let s = Self::get_effective_server_option("custom-rendezvous-server");
         if !s.is_empty() {
             return vec![s];
+        }
+        if Self::is_provisioned_server_required() {
+            return Vec::new();
         }
         let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
         if !s.is_empty() {
@@ -963,6 +977,9 @@ impl Config {
 
     pub fn update_latency(host: &str, latency: i64) {
         ONLINE.lock().unwrap().insert(host.to_owned(), latency);
+        if Self::has_hidden_server_profile() && !Self::is_manual_server_profile() {
+            return;
+        }
         let mut host = "".to_owned();
         let mut delay = i64::MAX;
         for (tmp_host, tmp_delay) in ONLINE.lock().unwrap().iter() {
@@ -1249,6 +1266,52 @@ impl Config {
         .unwrap_or_default()
     }
 
+    pub fn set_hidden_server_profile(options: HashMap<String, String>, password: String) -> bool {
+        let changed = *HIDDEN_SERVER_SETTINGS.read().unwrap() != options;
+        *HIDDEN_SERVER_SETTINGS.write().unwrap() = options;
+        *HIDDEN_SERVER_PASSWORD.write().unwrap() = password;
+        if Self::has_hidden_server_profile() && !Self::is_manual_server_profile() {
+            let mut config = CONFIG2.write().unwrap();
+            if !config.rendezvous_server.is_empty() {
+                config.rendezvous_server.clear();
+                config.store();
+            }
+        }
+        changed
+    }
+
+    pub fn set_provisioned_server_required(required: bool) {
+        PROVISIONED_SERVER_REQUIRED.store(required, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_provisioned_server_required() -> bool {
+        PROVISIONED_SERVER_REQUIRED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn get_effective_server_option(k: &str) -> String {
+        if Self::is_manual_server_profile() {
+            return Self::get_option(k);
+        }
+        HIDDEN_SERVER_SETTINGS
+            .read()
+            .unwrap()
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| Self::get_option(k))
+    }
+
+    pub fn is_manual_server_profile() -> bool {
+        !Self::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER).is_empty()
+    }
+
+    pub fn has_hidden_server_profile() -> bool {
+        HIDDEN_SERVER_SETTINGS
+            .read()
+            .unwrap()
+            .get(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER)
+            .map_or(false, |value| !value.is_empty())
+    }
+
     pub fn get_bool_option(k: &str) -> bool {
         option2bool(k, &Self::get_option(k))
     }
@@ -1413,7 +1476,13 @@ impl Config {
         let hard_settings = HARD_SETTINGS.read().unwrap();
         let storage = hard_settings.get("password").cloned().unwrap_or_default();
         let salt = hard_settings.get("salt").cloned().unwrap_or_default();
-        (storage, salt)
+        if !storage.is_empty() {
+            return (storage, salt);
+        }
+        if Self::is_manual_server_profile() {
+            return (String::new(), String::new());
+        }
+        (HIDDEN_SERVER_PASSWORD.read().unwrap().clone(), salt)
     }
 
     pub fn get_effective_permanent_password_salt() -> String {
@@ -3291,7 +3360,10 @@ mod tests {
 
     struct ConfigStateTestGuard {
         original_config: Config,
+        original_config2: Config2,
         original_hard_settings: HashMap<String, String>,
+        original_hidden_server_settings: HashMap<String, String>,
+        original_hidden_server_password: String,
     }
 
     struct ConfigFileRestoreGuard {
@@ -3302,12 +3374,19 @@ mod tests {
     impl ConfigStateTestGuard {
         fn new(config: Config, hard_settings: HashMap<String, String>) -> Self {
             let original_config = Config::get();
+            let original_config2 = Config2::get();
             let original_hard_settings = HARD_SETTINGS.read().unwrap().clone();
+            let original_hidden_server_settings = HIDDEN_SERVER_SETTINGS.read().unwrap().clone();
+            let original_hidden_server_password = HIDDEN_SERVER_PASSWORD.read().unwrap().clone();
             *CONFIG.write().unwrap() = config;
+            *CONFIG2.write().unwrap() = Config2::default();
             *HARD_SETTINGS.write().unwrap() = hard_settings;
             Self {
                 original_config,
+                original_config2,
                 original_hard_settings,
+                original_hidden_server_settings,
+                original_hidden_server_password,
             }
         }
     }
@@ -3315,7 +3394,10 @@ mod tests {
     impl Drop for ConfigStateTestGuard {
         fn drop(&mut self) {
             *CONFIG.write().unwrap() = self.original_config.clone();
+            *CONFIG2.write().unwrap() = self.original_config2.clone();
             *HARD_SETTINGS.write().unwrap() = self.original_hard_settings.clone();
+            *HIDDEN_SERVER_SETTINGS.write().unwrap() = self.original_hidden_server_settings.clone();
+            *HIDDEN_SERVER_PASSWORD.write().unwrap() = self.original_hidden_server_password.clone();
         }
     }
 
@@ -3360,6 +3442,68 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_hidden_server_profile_is_effective_but_not_exposed_as_user_config() {
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            Config::set_hidden_server_profile(
+                HashMap::from([
+                    (
+                        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+                        "hidden.example:21116".to_owned(),
+                    ),
+                    (
+                        keys::OPTION_RELAY_SERVER.to_owned(),
+                        "hidden-relay".to_owned(),
+                    ),
+                ]),
+                "hidden-password".to_owned(),
+            );
+
+            assert!(Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER).is_empty());
+            assert_eq!(
+                Config::get_effective_server_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+                "hidden.example:21116"
+            );
+            assert_eq!(
+                Config::get_preset_password_storage_and_salt().0,
+                "hidden-password"
+            );
+        });
+    }
+
+    #[test]
+    fn test_manual_server_profile_never_inherits_hidden_fields_or_password() {
+        let manual = Config::default();
+        let mut manual_options = Config2::default();
+        manual_options.options.insert(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            "manual.example:21116".to_owned(),
+        );
+        with_config_and_hard_settings(manual, HashMap::new(), || {
+            *CONFIG2.write().unwrap() = manual_options;
+            Config::set_hidden_server_profile(
+                HashMap::from([
+                    (
+                        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+                        "hidden.example:21116".to_owned(),
+                    ),
+                    (
+                        keys::OPTION_RELAY_SERVER.to_owned(),
+                        "hidden-relay".to_owned(),
+                    ),
+                ]),
+                "hidden-password".to_owned(),
+            );
+
+            assert_eq!(
+                Config::get_effective_server_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+                "manual.example:21116"
+            );
+            assert!(Config::get_effective_server_option(keys::OPTION_RELAY_SERVER).is_empty());
+            assert!(Config::get_preset_password_storage_and_salt().0.is_empty());
+        });
     }
 
     #[test]

@@ -356,7 +356,7 @@ pub fn check_ws(endpoint: &str) -> String {
     };
 
     let custom_rendezvous_server = Config::get_rendezvous_server();
-    let relay_server = Config::get_option(OPTION_RELAY_SERVER);
+    let relay_server = Config::get_effective_server_option(OPTION_RELAY_SERVER);
     let rendezvous_port = split_host_port(&custom_rendezvous_server)
         .map(|(_, p)| p)
         .unwrap_or(RENDEZVOUS_PORT);
@@ -388,7 +388,7 @@ pub fn check_ws(endpoint: &str) -> String {
         (format!("{}{}", endpoint_host, domain_path), true)
     };
     let protocol = if is_domain {
-        let api_server = Config::get_option("api-server");
+        let api_server = Config::get_effective_server_option("api-server");
         if api_server.starts_with("https") {
             "wss"
         } else {
