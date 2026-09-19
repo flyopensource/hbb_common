@@ -87,6 +87,8 @@ lazy_static::lazy_static! {
 
 static PROVISIONED_SERVER_REQUIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static DESKTOP_MANAGED_SERVER_PROFILE_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "android")]
 lazy_static::lazy_static! {
@@ -977,7 +979,9 @@ impl Config {
 
     pub fn update_latency(host: &str, latency: i64) {
         ONLINE.lock().unwrap().insert(host.to_owned(), latency);
-        if Self::has_hidden_server_profile() && !Self::is_manual_server_profile() {
+        if Self::desktop_managed_server_profile_active()
+            || (Self::has_hidden_server_profile() && !Self::is_manual_server_profile())
+        {
             return;
         }
         let mut host = "".to_owned();
@@ -1280,6 +1284,34 @@ impl Config {
         changed
     }
 
+    pub fn set_desktop_managed_server_profile(options: HashMap<String, String>) -> bool {
+        let was_active = Self::desktop_managed_server_profile_active();
+        let changed = !was_active || *HIDDEN_SERVER_SETTINGS.read().unwrap() != options;
+        *HIDDEN_SERVER_SETTINGS.write().unwrap() = options;
+        HIDDEN_SERVER_PASSWORD.write().unwrap().clear();
+        DESKTOP_MANAGED_SERVER_PROFILE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = CONFIG2.write().unwrap();
+        if !config.rendezvous_server.is_empty() {
+            config.rendezvous_server.clear();
+            config.store();
+        }
+        changed
+    }
+
+    pub fn clear_desktop_managed_server_profile() -> bool {
+        let was_active =
+            DESKTOP_MANAGED_SERVER_PROFILE_ACTIVE.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if was_active {
+            HIDDEN_SERVER_SETTINGS.write().unwrap().clear();
+            HIDDEN_SERVER_PASSWORD.write().unwrap().clear();
+        }
+        was_active
+    }
+
+    pub fn desktop_managed_server_profile_active() -> bool {
+        DESKTOP_MANAGED_SERVER_PROFILE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn set_provisioned_server_required(required: bool) {
         PROVISIONED_SERVER_REQUIRED.store(required, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1289,7 +1321,7 @@ impl Config {
     }
 
     pub fn get_effective_server_option(k: &str) -> String {
-        if Self::is_manual_server_profile() {
+        if Self::is_manual_server_profile() && !Self::desktop_managed_server_profile_active() {
             return Self::get_option(k);
         }
         HIDDEN_SERVER_SETTINGS
@@ -3364,6 +3396,7 @@ mod tests {
         original_hard_settings: HashMap<String, String>,
         original_hidden_server_settings: HashMap<String, String>,
         original_hidden_server_password: String,
+        original_desktop_managed_server_profile_active: bool,
     }
 
     struct ConfigFileRestoreGuard {
@@ -3378,15 +3411,20 @@ mod tests {
             let original_hard_settings = HARD_SETTINGS.read().unwrap().clone();
             let original_hidden_server_settings = HIDDEN_SERVER_SETTINGS.read().unwrap().clone();
             let original_hidden_server_password = HIDDEN_SERVER_PASSWORD.read().unwrap().clone();
+            let original_desktop_managed_server_profile_active =
+                Config::desktop_managed_server_profile_active();
             *CONFIG.write().unwrap() = config;
             *CONFIG2.write().unwrap() = Config2::default();
             *HARD_SETTINGS.write().unwrap() = hard_settings;
+            DESKTOP_MANAGED_SERVER_PROFILE_ACTIVE
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             Self {
                 original_config,
                 original_config2,
                 original_hard_settings,
                 original_hidden_server_settings,
                 original_hidden_server_password,
+                original_desktop_managed_server_profile_active,
             }
         }
     }
@@ -3398,6 +3436,10 @@ mod tests {
             *HARD_SETTINGS.write().unwrap() = self.original_hard_settings.clone();
             *HIDDEN_SERVER_SETTINGS.write().unwrap() = self.original_hidden_server_settings.clone();
             *HIDDEN_SERVER_PASSWORD.write().unwrap() = self.original_hidden_server_password.clone();
+            DESKTOP_MANAGED_SERVER_PROFILE_ACTIVE.store(
+                self.original_desktop_managed_server_profile_active,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -3503,6 +3545,51 @@ mod tests {
             );
             assert!(Config::get_effective_server_option(keys::OPTION_RELAY_SERVER).is_empty());
             assert!(Config::get_preset_password_storage_and_salt().0.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_desktop_managed_server_profile_overrides_and_restores_manual_profile() {
+        let manual = Config::default();
+        let mut manual_options = Config2::default();
+        manual_options.options.insert(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            "manual.example:21116".to_owned(),
+        );
+        manual_options.options.insert(
+            keys::OPTION_RELAY_SERVER.to_owned(),
+            "manual-relay.example:21117".to_owned(),
+        );
+        with_config_and_hard_settings(manual, HashMap::new(), || {
+            *CONFIG2.write().unwrap() = manual_options;
+            assert!(Config::set_desktop_managed_server_profile(HashMap::from([
+                (
+                    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+                    "managed.example:21116".to_owned(),
+                ),
+                (
+                    keys::OPTION_RELAY_SERVER.to_owned(),
+                    "managed-relay.example:21117".to_owned(),
+                ),
+            ])));
+
+            assert_eq!(
+                Config::get_effective_server_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+                "managed.example:21116"
+            );
+            assert_eq!(
+                Config::get_effective_server_option(keys::OPTION_RELAY_SERVER),
+                "managed-relay.example:21117"
+            );
+            assert!(Config::clear_desktop_managed_server_profile());
+            assert_eq!(
+                Config::get_effective_server_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER),
+                "manual.example:21116"
+            );
+            assert_eq!(
+                Config::get_effective_server_option(keys::OPTION_RELAY_SERVER),
+                "manual-relay.example:21117"
+            );
         });
     }
 
