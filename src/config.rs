@@ -1386,6 +1386,10 @@ impl Config {
         if Self::is_disable_change_permanent_password() {
             return false;
         }
+        Self::set_managed_permanent_password(password)
+    }
+
+    pub fn set_managed_permanent_password(password: &str) -> bool {
         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
         if preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password)
         {
